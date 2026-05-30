@@ -1,4 +1,4 @@
-"""Extract LoRA B matrices from Experiment 1 client adapters."""
+"""Extract LoRA and SVD-LoRA features from client adapters."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ import torch
 DEFAULT_ADAPTER_DIR = "outputs/adapters/exp1_lora_b"
 DEFAULT_OUTPUT_DIR = "outputs/features/exp1_lora_b"
 CLIENT_DIR_PATTERN = re.compile(r"^client_(\d+)$")
+SUPPORTED_MODES = ("lora_b", "svd_b", "svd_e_only", "svd_be", "svd_be_colnorm")
 
 
 def discover_clients(adapter_dir: Path) -> list[int]:
@@ -73,7 +74,109 @@ def extract_lora_b_layers(state_dict: dict[str, Any]) -> dict[str, torch.Tensor]
 
     if not layers:
         raise ValueError("No LoRA B matrices found in adapter state_dict.")
+    validate_finite_layers(layers)
     return layers
+
+
+def normalize_svd_lora_layer_name(parameter_name: str, suffix: str) -> str:
+    return parameter_name[: -len(suffix)]
+
+
+def group_svd_lora_layers(state_dict: dict[str, Any]) -> dict[str, dict[str, torch.Tensor]]:
+    grouped: dict[str, dict[str, torch.Tensor]] = {}
+    suffix_to_key = {
+        ".lora_A": "A",
+        ".lora_E": "E",
+        ".lora_B": "B",
+    }
+
+    for name, value in state_dict.items():
+        if not isinstance(value, torch.Tensor):
+            continue
+        for suffix, matrix_key in suffix_to_key.items():
+            if name.endswith(suffix):
+                layer_name = normalize_svd_lora_layer_name(name, suffix)
+                grouped.setdefault(layer_name, {})[matrix_key] = value.detach().cpu()
+                break
+
+    if not grouped:
+        raise ValueError("No SVD-LoRA parameters found in adapter state_dict.")
+
+    incomplete = {
+        layer_name: sorted({"A", "E", "B"} - set(layer_state))
+        for layer_name, layer_state in grouped.items()
+        if set(layer_state) != {"A", "E", "B"}
+    }
+    if incomplete:
+        raise ValueError(f"Incomplete SVD-LoRA layers found: {incomplete}")
+
+    return grouped
+
+
+def validate_svd_lora_layer_shapes(layer_name: str, layer_state: dict[str, torch.Tensor]) -> None:
+    a = layer_state["A"]
+    e = layer_state["E"]
+    b = layer_state["B"]
+    if a.ndim != 2:
+        raise ValueError(f"SVD-LoRA layer {layer_name!r} has non-2D A tensor with shape {tuple(a.shape)}")
+    if e.ndim != 1:
+        raise ValueError(f"SVD-LoRA layer {layer_name!r} has non-1D E tensor with shape {tuple(e.shape)}")
+    if b.ndim != 2:
+        raise ValueError(f"SVD-LoRA layer {layer_name!r} has non-2D B tensor with shape {tuple(b.shape)}")
+    if a.shape[0] != e.shape[0] or b.shape[1] != e.shape[0]:
+        raise ValueError(
+            f"SVD-LoRA layer {layer_name!r} has incompatible shapes: "
+            f"A={tuple(a.shape)}, E={tuple(e.shape)}, B={tuple(b.shape)}"
+        )
+
+
+def build_svd_feature(
+    *,
+    layer_name: str,
+    layer_state: dict[str, torch.Tensor],
+    mode: str,
+    eps: float,
+) -> torch.Tensor:
+    validate_svd_lora_layer_shapes(layer_name, layer_state)
+    e_abs = layer_state["E"].detach().cpu().abs()
+    b = layer_state["B"].detach().cpu()
+
+    if mode == "svd_b":
+        return b.clone()
+    if mode == "svd_e_only":
+        return e_abs.clone()
+    if mode == "svd_be":
+        return b * e_abs.view(1, -1)
+    if mode == "svd_be_colnorm":
+        b_norm = b / (b.norm(dim=0, keepdim=True) + eps)
+        return b_norm * e_abs.view(1, -1)
+    raise ValueError(f"Unsupported SVD-LoRA extraction mode: {mode}")
+
+
+def extract_svd_lora_layers(
+    state_dict: dict[str, Any],
+    *,
+    mode: str,
+    eps: float,
+) -> dict[str, torch.Tensor]:
+    grouped = group_svd_lora_layers(state_dict)
+    layers = {
+        layer_name: build_svd_feature(
+            layer_name=layer_name,
+            layer_state=layer_state,
+            mode=mode,
+            eps=eps,
+        ).detach().cpu()
+        for layer_name, layer_state in grouped.items()
+    }
+    validate_finite_layers(layers)
+    return layers
+
+
+def validate_finite_layers(layers: dict[str, torch.Tensor]) -> None:
+    for layer_name, tensor in layers.items():
+        if not torch.isfinite(tensor).all():
+            raise ValueError(f"Extracted feature for layer {layer_name!r} contains NaN or Inf values.")
 
 
 def load_metadata(meta_path: Path, client_id: int) -> dict[str, Any]:
@@ -123,7 +226,7 @@ def validate_layer_keys(
     missing = sorted(expected_keys - layer_keys)
     extra = sorted(layer_keys - expected_keys)
     if missing or extra:
-        message = [f"Client {client_id} has inconsistent LoRA B layer keys."]
+        message = [f"Client {client_id} has inconsistent layer keys."]
         if missing:
             message.append(f"Missing: {missing}")
         if extra:
@@ -137,6 +240,8 @@ def extract_client_features(
     adapter_dir: Path,
     output_dir: Path,
     client_id: int,
+    mode: str,
+    eps: float,
 ) -> tuple[dict[str, Any], set[str]]:
     client_dir = adapter_dir / f"client_{client_id}"
     adapter_path = client_dir / "adapter.pt"
@@ -144,11 +249,15 @@ def extract_client_features(
 
     metadata = load_metadata(meta_path, client_id)
     state_dict = load_adapter_state(adapter_path, client_id)
-    layers = extract_lora_b_layers(state_dict)
+    if mode == "lora_b":
+        layers = extract_lora_b_layers(state_dict)
+    else:
+        layers = extract_svd_lora_layers(state_dict, mode=mode, eps=eps)
 
     feature = {
         "client_id": client_id,
         "task_name": metadata["task_name"],
+        "mode": mode,
         "source_adapter_path": str(adapter_path),
         "layers": layers,
     }
@@ -156,12 +265,12 @@ def extract_client_features(
     output_dir.mkdir(parents=True, exist_ok=True)
     torch.save(feature, output_dir / f"client_{client_id}.pt")
 
-    print(f"client {client_id} task={metadata['task_name']} extracted {len(layers)} LoRA B matrices")
+    print(f"client {client_id} task={metadata['task_name']} mode={mode} extracted {len(layers)} layers")
     return feature, set(layers)
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Extract LoRA B matrices from Experiment 1 adapters.")
+    parser = argparse.ArgumentParser(description="Extract LoRA or SVD-LoRA features from client adapters.")
     parser.add_argument(
         "--adapter_dir",
         default=DEFAULT_ADAPTER_DIR,
@@ -179,11 +288,21 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Client ids to extract. If omitted, discover all client_* directories.",
     )
+    parser.add_argument(
+        "--mode",
+        choices=SUPPORTED_MODES,
+        default="lora_b",
+        help="Feature extraction mode.",
+    )
+    parser.add_argument("--eps", type=float, default=1e-12, help="Epsilon for SVD column normalization.")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if args.eps <= 0:
+        raise ValueError(f"--eps must be positive; got {args.eps}")
+
     adapter_dir = Path(args.adapter_dir)
     output_dir = Path(args.output_dir)
     client_ids = sorted(args.clients) if args.clients is not None else discover_clients(adapter_dir)
@@ -194,6 +313,8 @@ def main() -> None:
             adapter_dir=adapter_dir,
             output_dir=output_dir,
             client_id=client_id,
+            mode=args.mode,
+            eps=args.eps,
         )
         expected_keys = validate_layer_keys(
             client_id=client_id,
@@ -201,7 +322,7 @@ def main() -> None:
             expected_keys=expected_keys,
         )
 
-    print("All clients have consistent LoRA B layer keys.")
+    print("All clients have consistent layer keys.")
 
 
 if __name__ == "__main__":
